@@ -7,9 +7,13 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 import { Pool } from "pg";
 import { z } from "zod";
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
+
 
 // ====== App ======
 const app = express();
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(bodyParser.json({ limit: "1mb" }));
@@ -18,8 +22,10 @@ const limiter = rateLimit({ windowMs: 60_000, max: 120 });
 app.use(limiter);
 
 // ====== DB ======
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-async function db(q, p = []) { return pool.query(q, p); }
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});async function db(q, p = []) { return pool.query(q, p); }
 
 // ====== OpenAI ======
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
