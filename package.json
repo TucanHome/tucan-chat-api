@@ -1,0 +1,20 @@
+{
+  "name": "tucan-chat-api",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "classify": "node classify.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "openai": "^4.58.1",
+    "pg": "^8.11.5",
+    "zod": "^3.23.8"
+  }
+}
