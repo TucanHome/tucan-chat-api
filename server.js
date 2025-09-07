@@ -54,11 +54,27 @@ async function wcFetch(path, params = {}) {
   if (!wcEnabled) return [];
   const base = WC_SITE.replace(/\/$/, "");
   const url = new URL(base + "/wp-json/wc/v3" + path);
+
+  // defaults de paginação
   const qp = { per_page: 8, status: "publish", ...params };
   Object.entries(qp).forEach(([k, v]) => url.searchParams.set(k, v));
+
+  // 1) tenta com Basic Auth (HTTPS)
   const auth = "Basic " + Buffer.from(`${WC_KEY}:${WC_SECRET}`).toString("base64");
-  const r = await fetch(url.toString(), { headers: { Authorization: auth } });
-  if (!r.ok) throw new Error(`WooCommerce error: ${r.status}`);
+  let r = await fetch(url.toString(), { headers: { Authorization: auth } });
+
+  // 2) se der 400/401, tenta via query string (alguns hosts exigem isso)
+  if (r.status === 400 || r.status === 401) {
+    const urlQS = new URL(url.toString());
+    urlQS.searchParams.set("consumer_key", WC_KEY);
+    urlQS.searchParams.set("consumer_secret", WC_SECRET);
+    r = await fetch(urlQS.toString());
+  }
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`WooCommerce error: ${r.status} - ${txt}`);
+  }
   return r.json();
 }
 
