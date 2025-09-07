@@ -4,17 +4,11 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
-import { Pool } from "pg";
-import { z } from "zod";
-import dns from "dns";
-import { URL } from "url";
-
-// --- Garantir preferência por IPv4 (Node 18+)
-dns.setDefaultResultOrder?.("ipv4first");
+import { createClient } from "@supabase/supabase-js";
 
 // ============ App ============
 const app = express();
-app.set("trust proxy", 1); // estamos atrás de proxy (Render)
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(bodyParser.json({ limit: "1mb" }));
@@ -22,165 +16,139 @@ app.use(bodyParser.json({ limit: "1mb" }));
 const limiter = rateLimit({ windowMs: 60_000, max: 120 });
 app.use(limiter);
 
-// ============ DB (Supabase) ============
-// Constrói Pool forçando IPv4 (resolve hostname do Supabase para A/IPv4)
-async function makePoolFromEnv() {
-  const raw = process.env.DATABASE_URL;
-  if (!raw) throw new Error("DATABASE_URL ausente");
+// ============ Supabase (HTTP) ============
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 
-  // parse a URL e extrai host/porta/db/credenciais
-  const u = new URL(raw);
-
-  // resolve para IPv4
-  const lookup4 = await dns.promises.lookup(u.hostname, { family: 4 });
-  const host4 = lookup4.address;
-
-  // monta config pg sem a querystring original (sslmode=require será respeitado via ssl abaixo)
-  const config = {
-    host: host4,
-    port: Number(u.port || 5432),
-    user: decodeURIComponent(u.username),
-    password: decodeURIComponent(u.password),
-    database: u.pathname.replace(/^\//, "") || "postgres",
-    // Supabase exige SSL
-    ssl: { rejectUnauthorized: false },
-    // opcional: timeouts mais amigáveis
-    statement_timeout: 20_000,
-    connectionTimeoutMillis: 10_000,
-  };
-
-  return new Pool(config);
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error("Faltam SUPABASE_URL e/ou SUPABASE_SERVICE_ROLE no ambiente.");
 }
 
-const pool = await makePoolFromEnv();
-async function db(q, p = []) {
-  return pool.query(q, p);
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+  auth: { persistSession: false },
+});
 
 // ============ OpenAI ============
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ============ Schemas/Helpers ============
-const CtxSchema = z.object({
-  session_id: z.string().min(6),
-  page: z.string(),
-  utm: z.object({
-    source: z.string().nullable().optional(),
-    medium: z.string().nullable().optional(),
-    campaign: z.string().nullable().optional(),
-    content: z.string().nullable().optional(),
-    term: z.string().nullable().optional(),
-  }).optional(),
-  started_at: z.string().optional(),
-  user_agent: z.string().optional(),
-});
-
+// ============ Helpers ============
 async function ensureSession(ctx) {
-  const c = CtxSchema.parse(ctx);
-  await db(
-    `INSERT INTO chat_sessions 
-     (session_id, page, utm_source, utm_medium, utm_campaign, utm_content, utm_term, started_at, user_agent)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     ON CONFLICT (session_id) DO NOTHING`,
-    [
-      c.session_id, c.page,
-      c.utm?.source || null, c.utm?.medium || null, c.utm?.campaign || null,
-      c.utm?.content || null, c.utm?.term || null,
-      c.started_at || new Date().toISOString(), c.user_agent || null,
-    ],
-  );
+  // upsert da sessão
+  const payload = {
+    session_id: ctx.session_id,
+    page: ctx.page || null,
+    utm_source: ctx?.utm?.source || null,
+    utm_medium: ctx?.utm?.medium || null,
+    utm_campaign: ctx?.utm?.campaign || null,
+    utm_content: ctx?.utm?.content || null,
+    utm_term: ctx?.utm?.term || null,
+    started_at: ctx.started_at || new Date().toISOString(),
+    user_agent: ctx.user_agent || null,
+  };
+  const { error } = await supabase.from("chat_sessions").upsert(payload, { onConflict: "session_id" });
+  if (error) console.error("ensureSession error:", error.message);
+}
+
+async function insertMessage(session_id, who, text, ts) {
+  const payload = { session_id, ts: ts || new Date().toISOString(), who, text: (text || "").slice(0, 8000) };
+  const { error } = await supabase.from("chat_messages").insert(payload);
+  if (error) console.error("insertMessage error:", error.message);
+}
+
+async function insertLead(session_id, lead) {
+  const payload = {
+    session_id,
+    nome: (lead?.nome || "").slice(0, 120),
+    whats: (lead?.whats || "").slice(0, 60),
+    lgpd_optin: !!lead?.lgpd_optin,
+  };
+  const { error } = await supabase
+    .from("chat_leads")
+    .upsert(payload, { onConflict: "session_id" });
+  if (error) console.error("insertLead error:", error.message);
 }
 
 // ============ Rotas ============
 app.get("/api/health", (_, res) => res.json({ ok: true }));
 
 app.post("/api/log", async (req, res) => {
-  const { kind, ts, data, ...ctx } = req.body;
-  await ensureSession(ctx);
-  if (kind === "message") {
-    const who = data?.who === "user" ? "user" : "bot";
-    const text = (data?.text || "").toString().slice(0, 8000);
-    await db(
-      `INSERT INTO chat_messages (session_id, ts, who, text) VALUES ($1,$2,$3,$4)`,
-      [ctx.session_id, ts || new Date().toISOString(), who, text],
-    );
-  }
-  res.json({ ok: true });
-});
-
-// Lead + Brevo
-app.post("/api/lead", async (req, res) => {
-  const { lead, ...ctx } = req.body;
-  await ensureSession(ctx);
-  const nome  = (lead?.nome  || "").toString().slice(0, 120);
-  const whats = (lead?.whats || "").toString().slice(0, 60);
-  const optin = !!lead?.lgpd_optin;
-
-  await db(
-    `INSERT INTO chat_leads (session_id, nome, whats, lgpd_optin, created_at)
-     VALUES ($1,$2,$3,$4,NOW())
-     ON CONFLICT (session_id) DO UPDATE 
-       SET nome=EXCLUDED.nome, whats=EXCLUDED.whats, lgpd_optin=EXCLUDED.lgpd_optin`,
-    [ctx.session_id, nome, whats, optin],
-  );
-
   try {
-    if (process.env.BREVO_API_KEY) {
-      const resp = await fetch("https://api.brevo.com/v3/contacts", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "api-key": process.env.BREVO_API_KEY,
-        },
-        body: JSON.stringify({
-          attributes: { NOME: nome, WHATS: whats, ORIGEM: "Chat Tucan" },
-          updateEnabled: true,
-          listIds: [6], // sua lista
-        }),
-      });
-      await resp.json().catch(()=>{});
+    const { kind, ts, data, ...ctx } = req.body || {};
+    if (!ctx?.session_id) return res.json({ ok: true });
+
+    await ensureSession(ctx);
+    if (kind === "message") {
+      const who = data?.who === "user" ? "user" : "bot";
+      await insertMessage(ctx.session_id, who, data?.text || "", ts);
     }
-  } catch (e) {
-    console.error("Brevo error:", e.message);
+    res.json({ ok: true });
+  } catch {
+    res.json({ ok: true });
   }
-
-  res.json({ ok: true });
 });
 
-// Chat
-app.post("/api/chat", async (req, res) => {
-  const { messages = [], ...ctx } = req.body;
-  await ensureSession(ctx);
-
-  const system = {
-    role: "system",
-    content:
-      "Você é o consultor de interiores da Tucan Home. Fale em PT-BR. " +
-      "Não recomende madeira/metal nem luz ajustável; prefira plástico/gesso. " +
-      "Sugira produtos Tucan quando fizer sentido. Seja prático, com medidas e paletas.",
-  };
-
+app.post("/api/lead", async (req, res) => {
+  const { lead, ...ctx } = req.body || {};
   try {
+    await ensureSession(ctx);
+    await insertLead(ctx.session_id, lead);
+
+    // Brevo (opcional)
+    try {
+      if (process.env.BREVO_API_KEY) {
+        await fetch("https://api.brevo.com/v3/contacts", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "api-key": process.env.BREVO_API_KEY,
+          },
+          body: JSON.stringify({
+            attributes: { NOME: lead?.nome || "", WHATS: lead?.whats || "", ORIGEM: "Chat Tucan" },
+            updateEnabled: true,
+            listIds: [6],
+          }),
+        });
+      }
+    } catch (e) {
+      console.error("Brevo error:", e.message);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("lead error:", e.message);
+    res.status(200).json({ ok: true }); // nunca derruba o chat por causa do lead
+  }
+});
+
+app.post("/api/chat", async (req, res) => {
+  const { messages = [], ...ctx } = req.body || {};
+  try {
+    await ensureSession(ctx);
+
+    const system = {
+      role: "system",
+      content:
+        "Você é o consultor de interiores da Tucan Home. Fale em PT-BR, seja prático. " +
+        "Sugira paletas e produtos da Tucan quando fizer sentido.",
+    };
+
     const r = await client.responses.create({
       model: "gpt-4o-mini",
       input: [system, ...messages],
     });
-    const out = r.output_text || "Desculpe, não consegui responder agora.";
 
-    await db(
-      `INSERT INTO chat_messages (session_id, ts, who, text) VALUES ($1,NOW(),'bot',$2)`,
-      [ctx.session_id, out.slice(0, 8000)],
-    );
+    const out = r.output_text || "Desculpe, não consegui responder agora.";
+    await insertMessage(ctx.session_id, "bot", out);
     res.json({ output_text: out });
   } catch (e) {
-    console.error("OpenAI/Chat error:", e.message);
-    res.status(500).json({ error: "Falha ao gerar resposta." });
+    console.error("chat error:", e.message);
+    res.status(200).json({ output_text: "Estou em manutenção no momento. Tente novamente em instantes 🙏" });
   }
 });
 
-// opcional: evita "Cannot GET /"
+// raiz opcional
 app.get("/", (_, res) => {
-  res.send("Tucan Chat API está rodando. Use /api/health para checar o status.");
+  res.send("Tucan Chat API rodando. Use /api/health para status.");
 });
 
 const port = process.env.PORT || 3000;
